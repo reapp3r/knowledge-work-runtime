@@ -7,3 +7,5 @@
 !.env.example
 # Per-machine retro watermark (transcripts live in each machine's ~/.claude)
 last-mined-*
+# Ephemeral, deployment-specific triage backlog (not part of the published reference)
+improvements/
