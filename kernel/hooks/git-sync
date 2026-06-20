@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# git-sync — commit the working tree and push, scoped to the runtime area.
+#
+# The deterministic core of the "commit & push as you go" policy. Two callers:
+#   - the agent, after each completed unit of work:  <path>/git-sync -m "workspace: …"
+#   - the SessionEnd safety-net hook in each runtime's settings.json (no message → auto)
+#
+# Scope (what gets staged) when no explicit paths are given:
+#   - the session's cwd subtree, relative to repo root — so a session commits only
+#     what it works on and won't sweep a concurrent session's edits in another
+#     area. Launch from a sub-dir → that sub-dir; from workspace/ → the whole
+#     orchestrator area; from data/ → data; from the repo root → the whole tree.
+#   - --all / -a forces whole-tree regardless of cwd
+#   - explicit trailing paths override scope entirely
+#
+# Always: stage → commit (skipped if nothing staged) → push, with a
+# `pull --rebase --autostash` retry on a non-fast-forward reject (the multi-machine
+# case). No-op and exit 0 when the tree is clean and in sync. --dry-run prints the
+# plan and touches nothing.
+#
+# Exit: 0 success / nothing to do; 1 push blocked by a real conflict or error.
+
+set -uo pipefail
+
+MSG=""
+FORCE_ALL=0
+DRY=0
+PATHS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--message) MSG="${2:-}"; shift 2 ;;
+    -a|--all)     FORCE_ALL=1; shift ;;
+    -n|--dry-run) DRY=1; shift ;;
+    -h|--help)
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    --) shift; while [[ $# -gt 0 ]]; do PATHS+=("$1"); shift; done ;;
+    *)  PATHS+=("$1"); shift ;;
+  esac
+done
+
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "git-sync: not in a git repo" >&2; exit 1; }
+
+# Scope = the session's cwd subtree relative to repo root (captured before we cd
+# to the root to operate). "" when the cwd is the repo root → whole tree.
+here=$(pwd -P)
+rel=${here#"$repo"}; rel=${rel#/}
+
+cd "$repo" || { echo "git-sync: cannot cd to repo root" >&2; exit 1; }
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+# ---- stage --------------------------------------------------------------------
+if [[ ${#PATHS[@]} -gt 0 ]]; then
+  scope_label="${PATHS[*]}"
+  stage=(git add -- "${PATHS[@]}")
+elif [[ $FORCE_ALL -eq 1 || -z "$rel" ]]; then
+  scope_label="repo"
+  stage=(git add -A)
+else
+  scope_label="$rel"
+  stage=(git add -A -- "$rel")
+fi
+
+if [[ $DRY -eq 1 ]]; then
+  echo "git-sync [dry-run] branch=$branch scope=$scope_label"
+  echo "would: ${stage[*]}"
+  "${stage[@]}" --dry-run 2>/dev/null | sed 's/^/  /'
+  git reset -q 2>/dev/null
+  exit 0
+fi
+
+"${stage[@]}" 2>/dev/null
+
+# ---- commit (only if something is staged) -------------------------------------
+committed=0
+if ! git diff --cached --quiet 2>/dev/null; then
+  if [[ -z "$MSG" ]]; then
+    n=$(git diff --cached --name-only | wc -l | tr -d ' ')
+    dirs=$(git diff --cached --name-only | sed 's#/.*##' | sort -u | paste -sd, -)
+    MSG="$scope_label: auto-sync — $n file(s) [$dirs]"
+  fi
+  git commit -q -m "$MSG" || { echo "git-sync: commit failed" >&2; exit 1; }
+  committed=1
+fi
+
+# ---- push (if we committed, or local is ahead of upstream) --------------------
+have_upstream=0
+git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 && have_upstream=1
+
+ahead=0
+if [[ $have_upstream -eq 1 ]]; then
+  ahead=$(git rev-list '@{u}..HEAD' --count 2>/dev/null || echo 0)
+fi
+
+if [[ $committed -eq 0 && $ahead -eq 0 ]]; then
+  exit 0   # clean and in sync — nothing to do
+fi
+
+err=$(mktemp)
+trap 'rm -f "$err"' EXIT
+for attempt in 1 2 3; do
+  if [[ $have_upstream -eq 1 ]]; then
+    git push 2>"$err" && { echo "git-sync: pushed ($scope_label)"; exit 0; }
+  else
+    git push -u origin "$branch" 2>"$err" && { echo "git-sync: pushed -u ($scope_label)"; exit 0; }
+  fi
+  if grep -qiE 'rejected|non-fast-forward|fetch first|tip of your current branch is behind' "$err"; then
+    if git pull --rebase --autostash >/dev/null 2>&1; then
+      continue   # retry push on rebased history
+    fi
+    git rebase --abort >/dev/null 2>&1
+    echo "git-sync: pull --rebase hit a conflict — commit is local, resolve and push manually" >&2
+    exit 1
+  fi
+  # some other failure (auth, network, no remote)
+  echo "git-sync: push failed —" >&2; cat "$err" >&2
+  exit 1
+done
+echo "git-sync: still rejected after 3 attempts (remote moving fast?) — commit is safe locally" >&2
+exit 1

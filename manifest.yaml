@@ -1,0 +1,191 @@
+# manifest.yaml — machine index for knowledge-work-runtime
+#
+# The install catalog. Every module is self-describing: `installs_to` says where it
+# lands in the target, `verbatim` says copy-vs-adapt, `parameterize` lists the few
+# placeholders to fill. Read it alongside apply/runbook.md when installing; the
+# short docs/ files explain the patterns this catalog points to.
+#
+# Source of truth: this manifest. When a module moves or changes, update its row
+# here in the same change (see CLAUDE.md § Self-maintenance).
+
+meta:
+  name: knowledge-work-runtime
+  one_line: A Claude Code operating system for specialist knowledge work.
+  model: cwd-selects-runtime          # Claude Code reads exactly ONE .claude/ per session, chosen by the launch directory
+  apply: apply/runbook.md             # the install procedure an agent follows in a target project
+  governance: kernel/rules/shared/canonical.md   # authoring discipline (this repo governs itself by it)
+
+# ── The mandatory substrate. Always installed, regardless of which runtimes a project picks. ──
+kernel:
+  always_installed: true
+  installs_to: .claude/                # the project root's shared layer
+  modules:
+    - id: boundary
+      path: kernel/hooks/boundary_scope.py
+      role: kernel
+      purpose: One source of truth for "what is in scope" — repo-root via .git walk, runtime+sibling scope, /tmp + auto-memory exceptions. Consumed by the two boundary wrappers.
+      installs_to: .claude/hooks/shared/
+      verbatim: true
+      parameterize: [SIBLINGS]         # the list of runtime dir names in the target (default: the 4 runtimes + ".claude")
+      wired_by: [read-boundary, bash-boundary]
+      doc: docs/30-boundaries.md
+    - id: read-boundary
+      path: kernel/hooks/read-boundary.sh
+      role: kernel
+      purpose: PreToolUse(Read|Write|Edit|NotebookEdit|Glob|Grep) — blocks path-bearing tool calls that resolve outside scope. Thin wrapper over boundary_scope.py.
+      installs_to: .claude/hooks/shared/
+      verbatim: true
+      wire: 'PreToolUse matcher "Read|Write|Edit|NotebookEdit|Glob|Grep"'
+    - id: bash-boundary
+      path: kernel/hooks/bash-boundary.sh
+      role: kernel
+      purpose: PreToolUse(Bash) — lexes shell tokens, blocks out-of-scope path operands. Guardrail against ACCIDENTAL escape, not a security boundary (see docs/30 — pair with the OS sandbox).
+      installs_to: .claude/hooks/shared/
+      verbatim: true
+      wire: 'PreToolUse matcher "Bash"'
+    - id: area-write-gate
+      path: kernel/hooks/area-write-gate.sh
+      role: kernel
+      purpose: PreToolUse(Write|Edit|NotebookEdit) — area ownership. Each runtime's content is writable only in its own session; a curated area (reference) is writable only via its curator subagent. Wired at ROOT only.
+      installs_to: .claude/hooks/shared/
+      verbatim: false
+      parameterize: [OWNED_AREAS]      # which runtime dirs are write-gated and how (own-session vs curator-subagent)
+      wire: 'root .claude/settings.json PreToolUse matcher "Write|Edit|NotebookEdit"'
+      doc: docs/30-boundaries.md
+    - id: kernel-inject-sessionstart
+      path: kernel/hooks/kernel-inject-sessionstart.sh
+      role: kernel
+      purpose: SessionStart — on compact/resume, re-injects the runtime CLAUDE.md + a recovery reminder; resets the prompt-count cadence. Fights post-compaction rule decay.
+      installs_to: <runtime>/.claude/hooks/<runtime>/
+      verbatim: false
+      parameterize: [RECOVERY_REMINDER]   # the per-runtime "re-orient by re-reading X" note
+      wire: 'SessionStart matcher ""'
+      doc: docs/40-hooks.md
+    - id: kernel-inject-userprompt
+      path: kernel/hooks/kernel-inject-userprompt.sh
+      role: kernel
+      purpose: UserPromptSubmit — re-injects the runtime CLAUDE.md every Nth prompt (modulo-gated, suppress-first-N). Counters mid-session decay.
+      installs_to: <runtime>/.claude/hooks/<runtime>/
+      verbatim: true
+      env: [KERNEL_INJECT_FREQUENCY=6, KERNEL_INJECT_SUPPRESS_FIRST=3]
+      wire: 'UserPromptSubmit matcher ""'
+    - id: precompact-state-dump
+      path: kernel/hooks/precompact-state-dump.sh
+      role: kernel
+      purpose: PreCompact — best-effort snapshot of hook-input state to .scratch before compaction. Recovery aid; never blocks.
+      installs_to: <runtime>/.claude/hooks/<runtime>/
+      verbatim: false
+      wire: 'PreCompact matcher "auto"'
+    - id: git-sync
+      path: kernel/hooks/git-sync
+      role: kernel
+      purpose: Commit-and-push-as-you-go, scoped to the session's cwd subtree (so concurrent runtime sessions don't sweep each other). Called by the agent after a unit of work and by the SessionEnd safety-net.
+      installs_to: tools/bin/   # or any on-PATH bin; the SessionEnd hook references it by repo-relative path
+      verbatim: true
+      wire: 'SessionEnd matcher "" (per runtime)'
+      doc: docs/40-hooks.md
+    - id: skill-lesson
+      path: kernel/skills/lesson/SKILL.md
+      role: kernel
+      purpose: 5-second friction capture — append one line to the retro inbox. Capture only, never analyse.
+      installs_to: .claude/skills/lesson/
+      verbatim: false
+      parameterize: [OPERATOR_NAME]
+      doc: docs/60-retro-loop.md
+    - id: skill-retro
+      path: kernel/skills/retro/SKILL.md
+      role: kernel
+      purpose: Pull-based continuous-improvement pass — mine transcripts, cluster, propose rule promotions up the placement ladder (hook > injection > kernel > rule > agent-prompt > memory) with human approval, track whether they stick.
+      installs_to: .claude/skills/retro/
+      verbatim: false
+      parameterize: [OPERATOR_NAME, PLACEMENT_TARGETS]
+      doc: docs/60-retro-loop.md
+    - id: rule-canonical
+      path: kernel/rules/shared/canonical.md
+      role: kernel
+      purpose: Authoring discipline for all operational content — three-layer model (CLAUDE.md ≤200 lines / README rationale / path-scoped rules), the five-place "memory is residue" test, hard anti-bloat.
+      installs_to: .claude/rules/shared/
+      verbatim: true
+      doc: docs/50-memory-and-authoring.md
+    - id: rule-scratch
+      path: kernel/rules/shared/scratch.md
+      role: kernel
+      purpose: The .scratch/ ephemeral-working-state convention (where temp scripts / pipeline run artefacts go; gitignored; deletable without asking).
+      installs_to: .claude/rules/shared/
+      verbatim: true
+
+# ── Optional work runtimes. Install the kernel + workspace always; add the rest by need. ──
+runtimes:
+  workspace:
+    required: true
+    role: orchestrator + distilled artifacts
+    when: always — this is the runtime where the principal works and dispatches the specialist fleet
+    template: runtimes/workspace/
+    holds: [thin CLAUDE.md (parties/entities placeholder), a specialist agent fleet, per-agent memory, work-unit schemas, the dispatch + cascade rules]
+    doc: docs/20-runtimes.md
+    status: scaffold-pending           # next pass
+  data:
+    required: false
+    role: ingested source dataset (interrogated, not cited)
+    when: the project has a large EXTERNAL body of source material to ingest, classify, index, and RAG over
+    template: runtimes/data/
+    pairs_with_framework: pipeline
+    holds: [ingest/classify/index/RAG pipeline rules, the .md+.sumd pair convention, layout + schema lint hooks, a librarian + clerk agent]
+    doc: docs/70-pipeline.md
+    status: scaffold-pending
+  reference:
+    required: false
+    role: curated authority (cited, not interrogated)
+    when: the project needs a TRUSTED, tier-ranked reference base distinct from raw data, maintained by a curator
+    template: runtimes/reference/
+    pairs_with_framework: doctype-lint
+    holds: [doctype taxonomy + per-type lint, tier/verification discipline, curator agent, curator-queue, index rebuild]
+    note: writable only via the curator subagent (see area-write-gate OWNED_AREAS)
+    doc: docs/20-runtimes.md
+    status: scaffold-pending
+  tools:
+    required: false
+    role: first-party CLI/lib dev runtime
+    when: the project builds its own command-line tools (instead of, or alongside, MCP servers)
+    template: runtimes/tools/
+    holds: [the CLI source the data/workspace runtimes invoke, integrity.md (tie tool changes to rule+skill updates), no agent fleet]
+    note: skip this runtime entirely if you go pure-MCP
+    doc: docs/20-runtimes.md
+    status: scaffold-pending
+
+# ── Parameterizable frameworks. The engine is reusable; the content is project config. ──
+frameworks:
+  - id: pipeline
+    for: data
+    purpose: ingest → classify → extract → index → RAG over a collection, on the uniform .md+.sumd pair convention. Generic over collection types.
+    parameterize: [CLASSIFICATION_TAXONOMY, COLLECTION_TYPES]
+    status: port-pending
+    doc: docs/70-pipeline.md
+  - id: doctype-lint
+    for: reference
+    purpose: A doctype-linter framework — per-type checker plugins + a layout linter + index rebuild, enforced as exit-2 PreToolUse gates. Ship 1–2 generic example doctypes; the project defines its own.
+    parameterize: [DOCTYPES, TIER_MODEL, VERIFICATION_VALUES]
+    status: port-pending
+    doc: docs/20-runtimes.md
+  - id: schema-lint
+    for: workspace
+    purpose: A schema/layout/link lint-gate engine — block (exit 2) writes to schema-governed files that violate their frontmatter/layout/link grammar. Point it at the project's own work-unit schemas.
+    parameterize: [SCHEMAS, LINK_GRAMMAR]
+    status: port-pending
+    doc: docs/50-memory-and-authoring.md
+
+# ── Optional patterns (modules you bolt on when the domain calls for them). ──
+patterns:
+  - id: adversarial-mode
+    purpose: A red-team "shadow" mode with an information firewall — a marker file arms a PostToolUse firewall hook that confines writes to a shadow surface; specialists retrieve only what the adversary would see. For adversarial domains (security, debate, competitive analysis).
+    status: port-pending
+    doc: docs/20-runtimes.md
+
+docs:
+  - {path: docs/00-overview.md,            covers: the cwd-kernel model + the whole-system map}
+  - {path: docs/20-runtimes.md,            covers: the runtime archetype catalog}
+  - {path: docs/30-boundaries.md,          covers: boundary_scope + area-write-gate + the OS sandbox it should pair with}
+  - {path: docs/40-hooks.md,               covers: hook-first enforcement, exit-2, kernel re-injection, git-sync}
+  - {path: docs/50-memory-and-authoring.md, covers: per-agent memory + canonical.md authoring discipline}
+  - {path: docs/60-retro-loop.md,          covers: the /lesson -> /retro improvement loop + placement ladder}
+  - {path: docs/70-pipeline.md,            covers: the data pipeline + .md/.sumd convention}
