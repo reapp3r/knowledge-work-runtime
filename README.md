@@ -50,7 +50,7 @@ flowchart TB
 
 In whatever project you want the OS in, point Claude Code at this repo:
 
-> "Read `github.com/<you>/knowledge-work-runtime` and set it up in this project."
+> "Read `github.com/reapp3r/knowledge-work-runtime` and set it up in this project."
 
 The agent reads `manifest.yaml`, follows [`apply/runbook.md`](apply/runbook.md), and installs the kernel + the runtimes your project needs — parameterizing names, taxonomy, schemas, and the agent fleet as it goes.
 
